@@ -14,8 +14,9 @@ import typing
 from collections.abc import Sequence
 from huggingface_hub import login
 import csv
-import tqdm
+from tqdm import tqdm
 
+CUDA_LAUNCH_BLOCKING=1
 
 ### CoT Prompt String. 
 preamble = "As an expert problem solver, solve step by step the following mathematical questions."
@@ -68,8 +69,8 @@ VALID_CORRECT = "<vc>"
 VALID_INCORRECT = "<vi>"
 NUM_RE = re.compile(r"-?\d+[\d,]*\.?\d*")
 TEST_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
-HF_TOKEN = "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" # TODO : don't put this on gh
-MAX_TOKENS = 1024
+HF_TOKEN = "" # TODO : don't put this on gh
+MAX_TOKENS = 600
 DEVICE = 'cuda'
 SEED = 58 # pick any here idk 
 SAMPLES = 25 #TODO: Change this
@@ -166,84 +167,189 @@ def create_prompt(question):
         prompt.append(COT_PROMPT + 'Q: ' + q + "\n" + "A: " + LTSBS)
     return prompt
 
-def infer_per_token(model, tokenizer, prompts: Sequence[str], left=False, max_new_tokens=20):
-    """Greedy decode one token at a time, recording per-token timing."""
+def infer_sequential(model, tokenizer, prompt: Sequence[str], left=False) -> typing.Tuple[Sequence[str], list]:
+    torch.cuda.empty_cache()
+
     results = []
     timing_data = []
 
-    #sequential generation 
-    for idx, prompt in enumerate(tqdm(prompts)):
-        print(f"Now processing prompt {idx} of {len(prompts)}.\n")
-        torch.cuda.empty_cache()
-
-        # tokenize with timing
+    for i, p in enumerate(tqdm(prompt)):
+        # Time tokenization (cpu)
         t_start_tok = time.time()
         if left:
-            model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left').to(DEVICE)
+            model_inputs = tokenizer(p, return_tensors="pt", padding_side='left',
+                                     padding=True, truncation=True)
         else:
-            model_inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+            model_inputs = tokenizer(p, return_tensors="pt",
+                                     padding=True, truncation=True)
         t_end_tok = time.time()
         tokenization_time = t_end_tok - t_start_tok
-        input_len = model_inputs['input_ids'].shape[-1]
+        print(f'Tokenization Time: {tokenization_time}\n')
+        input_len = model_inputs['input_ids'].shape[1]
 
-        input_ids = model_inputs['input_ids']
-        attention_mask = model_inputs['attention_mask']
+        token_movement_start = time.time()
+        model_inputs.to(DEVICE)
+        torch.cuda.synchronize()
+        token_movement_end = time.time()
+        token_movement_time = token_movement_end - token_movement_start
+        print(f"token movement timing: {token_movement_time}")
 
-        # --- KV Cache Setup ---
+        # Mimic KV Timing.
+        start_kv, end_kv = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_kv.record()
         with torch.no_grad():
-            kv_start = torch.cuda.Event(enable_timing=True)
-            kv_end = torch.cuda.Event(enable_timing=True)
+            _ = model(**model_inputs)
+        end_kv.record()
+        torch.cuda.synchronize()
+        kv_time = start_kv.elapsed_time(end_kv) / 1000.0  # ms to s
+        print(f'KV Time: {kv_time}\n')
 
-            kv_start.record()
-            past_key_values = model(**model_inputs, use_cache=True).past_key_values
-            kv_end.record()
-            torch.cuda.synchronize()
-            kv_time = kv_start.elapsed_time(kv_end) / 1000  # seconds
+        # Time generation
+        start_gen, end_gen = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_gen.record()
+        with torch.no_grad():
+            generated_ids = model.generate(**model_inputs,
+                                           max_new_tokens=MAX_TOKENS,
+                                           do_sample=False,
+                                           num_return_sequences=1,
+                                           eos_token_id=tokenizer.eos_token_id,
+                                           early_stopping=True)
+        end_gen.record()
+        torch.cuda.synchronize()
+        gen_time = start_gen.elapsed_time(end_gen) / 1000.0  # ms to s
 
-        # generate token-by-token with greedy decoding
-        generated_tokens = []
-        per_token_times = []
+        total_time = kv_time + gen_time
+        print(f"Generation time: {gen_time}\n")
 
-        for _ in range(max_new_tokens):
-            next_input = {'input_ids': input_ids[:, -1:], 'past_key_values': past_key_values, 'use_cache': True}
-
-            with torch.no_grad():
-                tok_start = torch.cuda.Event(enable_timing=True)
-                tok_end = torch.cuda.Event(enable_timing=True)
-
-                tok_start.record()
-                outputs = model(**next_input)
-                tok_end.record()
-
-                torch.cuda.synchronize()
-                t_tok = tok_start.elapsed_time(tok_end) / 1000  # seconds
-                per_token_times.append(t_tok)
-
-            logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(logits, dim=-1, keepdim=True)
-
-            generated_tokens.append(next_token.item())
-
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            past_key_values = outputs.past_key_values
-
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-
-        output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        results.append(output_text)
 
         timing_data.append({
-            'index': idx,
+            'index': i,
             'question_length': input_len,
             'tokenization_time': tokenization_time,
             'kv_time': kv_time,
-            'generation_times': per_token_times,
-            'total_generation_time': sum(per_token_times),
-            'total_time': kv_time + sum(per_token_times)
+            'generation_time': gen_time,
+            'total_time': total_time,
         })
 
-    return results, timing_data
+    return timing_data
+
+def manual_decode_sequential(model, 
+                             tokenizer,
+                             prompts: Sequence[str],
+                             use_kv_cache: bool = True,
+                             left: bool = False,
+                             max_new_tokens: int = MAX_TOKENS
+                             ) -> typing.Tuple[Sequence[str], list]:
+
+    results = []
+    timing_data = []
+
+    for i, prompt in enumerate(tqdm(prompts)):
+        torch.cuda.empty_cache()
+
+        tokenizer.padding_side = 'left' if left else 'right'
+
+        # Time tokenization
+        t0_tok = torch.cuda.Event(enable_timing=True)
+        t1_tok = torch.cuda.Event(enable_timing=True)
+        t0_tok.record()
+        model_inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+        token_movement_start = time.time()
+        tokenized = model_inputs.to(DEVICE)
+        torch.cuda.synchronize()
+        token_movement_end = time.time()
+        token_movement_time = token_movement_end - token_movement_start
+        print(f"token movement timing: {token_movement_time}")
+
+        t1_tok.record()
+        torch.cuda.synchronize()
+        tokenization_time = t0_tok.elapsed_time(t1_tok) / 1000.0
+
+        print(f"Tokenization time: {tokenization_time}\n")
+
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+        input_len = input_ids.shape[-1]
+
+        past_key_values = None
+        generated = input_ids.clone().to(DEVICE)
+        current_input = input_ids.to(DEVICE)
+        current_mask = attention_mask.to(DEVICE)
+
+        first_step_time = 0.0
+        rest_gen_time = 0.0
+
+        # Time generation
+        with torch.no_grad():
+            for step in range(max_new_tokens):
+                start_ev = torch.cuda.Event(enable_timing=True)
+                end_ev = torch.cuda.Event(enable_timing=True)
+                start_ev.record()
+
+                if step % 25 == 0:
+                    print(f"single sequence step: {step}")
+
+                if use_kv_cache:
+                    out = model(
+                        input_ids=current_input,
+                        attention_mask=current_mask,
+                        past_key_values=past_key_values,
+                        use_cache=True
+                    )
+                    past_key_values = out.past_key_values
+                else:
+                    out = model(
+                        input_ids=generated,
+                        attention_mask=(generated != tokenizer.pad_token_id),
+                        use_cache=False
+                    )
+
+                end_ev.record()
+                torch.cuda.synchronize()
+                elapsed = start_ev.elapsed_time(end_ev) / 1000.0
+
+                if step == 0:
+                    first_step_time = elapsed
+                else:
+                    rest_gen_time += elapsed
+
+                next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True).to(DEVICE)
+                generated = torch.cat([generated, next_token], dim=-1)
+
+                # (cdz) Added early stopping at Q: generation. 
+                decoded_text = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
+                if "Q:" in decoded_text:
+                    break
+
+                if use_kv_cache:
+                    current_input = next_token
+                    current_mask = torch.cat([current_mask, torch.ones_like(next_token)], dim=-1)
+                else:
+                    current_input = generated
+
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+
+        total_gen_time = first_step_time + rest_gen_time
+        print(f"Generation time: {total_gen_time}\n")
+        total_time = total_gen_time
+
+        if i % 10 == 0:
+            result = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
+            print('-'*25 + 'EXAMPLE OUTPUT' + '-'*25)
+            print(result)
+            print('-'*25 + 'END EXAMPLE OUTPUT' + '-'*25)
+
+        timing_data.append({"index": i, "question_length": input_len,
+                            "tokenization_time": tokenization_time,
+                            "kv_time": first_step_time,
+                            "rest_gen_time": rest_gen_time,
+                            "generation_time": total_gen_time,
+                            "total_time": total_time,})
+
+    return timing_data
 
 
 def remove_prompt(prompts, model_inputs, tokenizer, generated_ids):
@@ -253,6 +359,7 @@ def remove_prompt(prompts, model_inputs, tokenizer, generated_ids):
         result = tokenizer.decode(generated_ids[i][input_length:])
         results.append(result)
     return results
+
 
 def main(argvs,i):
     global SAMPLES
@@ -285,9 +392,12 @@ def main(argvs,i):
     # or we get issues with repetion of padding tokens!
     # inference timing
     if isDecoder:
-        responses, timings = infer(model, tokenizer, [t[0] for t in tests], left=True)
+        # timings = infer_sequential(model, tokenizer, [t[0] for t in tests], left=True)
+        timings = manual_decode_sequential(model, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
     else:
-        responses, timings = infer(model, tokenizer, [t[0] for t in tests])
+        # timings = infer_sequential(model, tokenizer, [t[0] for t in tests])
+        timings = manual_decode_sequential(model, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
+
         
 
     csv_dir = os.path.join(argvs.out, "timing_logs")
@@ -295,9 +405,9 @@ def main(argvs,i):
     csv_path = os.path.join(csv_dir, f"{save_modname}_{i}.csv")
 
     with open(csv_path, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=[
-            'index', 'question_length', 'tokenization_time', 'kv_time', 'generation_time', 'total_time'
-        ])
+        writer = csv.DictWriter(csvfile, 
+                                fieldnames=['index', 'question_length', 'tokenization_time',
+                                            'kv_time', 'rest_gen_time', 'generation_time', 'total_time'])
         writer.writeheader()
         for row in timings:
             writer.writerow(row)
