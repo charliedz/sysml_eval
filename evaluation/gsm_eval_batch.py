@@ -165,7 +165,7 @@ def create_prompt(question):
         prompt.append(COT_PROMPT + 'Q: ' + q + "\n" + "A: " + LTSBS)
     return prompt
 
-def infer(model, tokenizer, prompt: Sequence, question_len, left=False) -> typing.Tuple[Sequence[str], list]:
+def infer(model, tokenizer, prompt: Sequence, left=False) -> typing.Tuple[Sequence[str], list]:
     """Handle inference and timings
     
     Args:

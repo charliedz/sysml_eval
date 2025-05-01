@@ -69,13 +69,14 @@ VALID_CORRECT = "<vc>"
 VALID_INCORRECT = "<vi>"
 NUM_RE = re.compile(r"-?\d+[\d,]*\.?\d*")
 TEST_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
-HF_TOKEN = "removed" # TODO : don't put this on gh
+HF_TOKEN = "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" # TODO : don't put this on gh
 MAX_TOKENS = 600
 DEVICE = 'cuda'
 SEED = 58 # pick any here idk 
 SAMPLES = 25 #TODO: Change this
 GSM8K_DATA = './data/gsm8k_test.jsonl'
 GSM_SYMBOLIC_DATA = "./data/Symbolic_Templates_26-50.json"
+EVALUATION_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -235,7 +236,8 @@ def infer_sequential(model, tokenizer, prompt: Sequence[str], left=False) -> typ
 
     return timing_data
 
-def manual_decode_sequential(model, 
+def manual_decode_sequential(model,
+                             model_name, 
                              tokenizer,
                              prompts: Sequence[str],
                              use_kv_cache: bool = True,
@@ -249,13 +251,22 @@ def manual_decode_sequential(model,
     for i, prompt in enumerate(tqdm(prompts)):
         torch.cuda.empty_cache()
 
-        tokenizer.padding_side = 'left' if left else 'right'
-
         # Time tokenization
         t0_tok = torch.cuda.Event(enable_timing=True)
         t1_tok = torch.cuda.Event(enable_timing=True)
         t0_tok.record()
-        model_inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+
+        if left:
+            if use_kv_cache:
+                model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='right',
+                                     padding=True, truncation=True)
+            else:
+                model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left',
+                                     padding=True, truncation=True)
+        else:
+            model_inputs = tokenizer(prompt, return_tensors="pt",
+                                     padding=True, truncation=True)
+
         token_movement_start = time.time()
         tokenized = model_inputs.to(DEVICE)
         torch.cuda.synchronize()
@@ -283,7 +294,8 @@ def manual_decode_sequential(model,
 
         # Time generation
         with torch.no_grad():
-            for step in range(max_new_tokens):
+            step = 0
+            while step < max_new_tokens:
                 start_ev = torch.cuda.Event(enable_timing=True)
                 end_ev = torch.cuda.Event(enable_timing=True)
                 start_ev.record()
@@ -322,25 +334,23 @@ def manual_decode_sequential(model,
                 decoded_text = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
                 if "Q:" in decoded_text:
                     break
-
+                if ANSWER_PHRASE in decoded_text:
+                    step = max_new_tokens - 10
+                
                 if use_kv_cache:
                     current_input = next_token
-                    current_mask = torch.cat([current_mask, torch.ones_like(next_token)], dim=-1)
+                    current_mask = torch.cat([current_mask, torch.ones((current_mask.size(0), 1), dtype=current_mask.dtype, device=current_mask.device)], dim=-1)
                 else:
                     current_input = generated
 
                 if next_token.item() == tokenizer.eos_token_id:
                     break
 
+                step += 1
+
         total_gen_time = first_step_time + rest_gen_time
         print(f"Generation time: {total_gen_time}\n")
         total_time = total_gen_time
-
-        if i % 10 == 0:
-            result = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
-            print('-'*25 + 'EXAMPLE OUTPUT' + '-'*25)
-            print(result)
-            print('-'*25 + 'END EXAMPLE OUTPUT' + '-'*25)
 
         timing_data.append({"index": i, "question_length": input_len,
                             "tokenization_time": tokenization_time,
@@ -348,6 +358,24 @@ def manual_decode_sequential(model,
                             "rest_gen_time": rest_gen_time,
                             "generation_time": total_gen_time,
                             "total_time": total_time,})
+        
+        if i % 10 == 0:
+            result = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
+            print('-'*25 + 'EXAMPLE OUTPUT' + '-'*25)
+            print(result)
+            print('-'*25 + 'END EXAMPLE OUTPUT' + '-'*25)
+
+            ckpts_dir = os.path.join(EVALUATION_DIR, "ckpts")
+            os.makedirs(ckpts_dir, exist_ok=True)
+            csv_path = os.path.join(ckpts_dir, f"{model_name}_ckpt_{i}.csv")
+
+            with open(csv_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, 
+                                        fieldnames=['index', 'question_length', 'tokenization_time',
+                                                    'kv_time', 'rest_gen_time', 'generation_time', 'total_time'])
+                writer.writeheader()
+                for row in timing_data:
+                    writer.writerow(row)
 
     return timing_data
 
@@ -368,7 +396,7 @@ def main(argvs,i):
     isDecoder = True if any(x in argvs.model.split('/')[1].lower() for x in
                              ('llama','gemma')) else False
 
-    model,tokenizer = load_model(argvs.model, dq=argvs.dq)
+    model, tokenizer = load_model(argvs.model, dq=argvs.dq)
     
     split_modname = argvs.model.split('/')
     save_modname = split_modname[1].strip()
@@ -393,10 +421,10 @@ def main(argvs,i):
     # inference timing
     if isDecoder:
         # timings = infer_sequential(model, tokenizer, [t[0] for t in tests], left=True)
-        timings = manual_decode_sequential(model, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
+        timings = manual_decode_sequential(model, save_modname, tokenizer, [t[0] for t in tests], use_kv_cache=False, left=True)
     else:
         # timings = infer_sequential(model, tokenizer, [t[0] for t in tests])
-        timings = manual_decode_sequential(model, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
+        timings = manual_decode_sequential(model, save_modname, tokenizer, [t[0] for t in tests], use_kv_cache=False, left=True)
 
         
 
