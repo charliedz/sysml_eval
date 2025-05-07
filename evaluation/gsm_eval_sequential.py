@@ -381,6 +381,10 @@ def main(argvs,i):
 
     if argvs.model == "google/gemma-2-2b-it":
         model_path = GEMMA_DIR
+    elif argvs.model == "mistralai/Mathstral-7B-v0.1":
+        model_path = MATHSTRAL_DIR
+    elif argvs.model == "microsoft/rho-math-1b-v0.1":
+        model_path = RHO_DIR
 
     model, tokenizer = load_model(model_path)
     
