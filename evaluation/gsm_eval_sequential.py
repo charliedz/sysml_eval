@@ -1,10 +1,9 @@
-''' (cdz) cmsc723 final 2024 '''
 
-# This script batches prompts and infers, rather than going one prompt at a time. 
+
 
 import os
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, cache_utils
 import torch
 import re
 import random
@@ -15,6 +14,7 @@ from collections.abc import Sequence
 from huggingface_hub import login
 import csv
 from tqdm import tqdm
+from torch.serialization import safe_globals
 
 CUDA_LAUNCH_BLOCKING=1
 
@@ -72,8 +72,6 @@ SAMPLES = 25 #TODO: Change this
 EVALUATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _BASE_DIR = os.path.dirname(EVALUATION_DIR)
 GSM_SYMBOLIC_DATA = os.path.join(EVALUATION_DIR, "data/Symbolic_Templates_26-50.json")
-
-
 
 GEMMA_DIR = os.path.join(EVALUATION_DIR, "models/gemma-2-2b-it")
 MATHSTRAL_DIR = os.path.join(EVALUATION_DIR, "models/Mathstral-7B-v0.1")
@@ -150,21 +148,32 @@ def create_prompt(question):
         prompt.append(COT_PROMPT + 'Q: ' + q + "\n" + "A: " + LTSBS)
     return prompt
 
+
 def load_prompt_kv(path: str, device: torch.device):
-    """
-    Load a serialized prompt cache and move to GPU
-    """
-    data = torch.load(path, map_location='cpu')
+    # Load the data from the file onto the CPU
+    with safe_globals([cache_utils.HybridCache]):
+        data = torch.load(path, map_location='cpu', weights_only=False)
+
     pkv_cpu = data["past_key_values"]
-    # Move back to device if possible
+    prompt_len = data["prompt_len"]
+    
+    # Validate cache sequence length
+    if isinstance(pkv_cpu, cache_utils.HybridCache):
+        seq_len = pkv_cpu.key_cache[0].shape[2]  # Access seq_len via key_cache
+    else:
+        raise TypeError(f"Unexpected type for past_key_values: {type(pkv_cpu)}")
+    
+    if seq_len != prompt_len:
+        raise ValueError(f"Cache seq_len {seq_len} does not match prompt_len {prompt_len}")
+    
+    # Move the cache to the specified device
     try:
         pkv_gpu = pkv_cpu.to(device)
     except Exception:
-        pkv_gpu = pkv_cpu
-    mask_gpu = data["prompt_mask"].to(device)
-    length = data["prompt_len"]
-    print(f"Loaded prompt KV cache from {path}")
-    return pkv_gpu, mask_gpu, length
+        pkv_gpu = pkv_cpu  # Already on GPU
+    
+    print(f"Loaded prompt KV cache from {path}, prompt_len={prompt_len}, cache_shape={pkv_cpu.key_cache[0].shape}")
+    return pkv_gpu, prompt_len
 
 def manual_decode_sequential(model,
                              model_name,
@@ -172,141 +181,194 @@ def manual_decode_sequential(model,
                              tokenizer,
                              prompts: Sequence[str],
                              use_kv_cache: bool = True,
-                             left: bool = False,
-                             max_new_tokens: int = MAX_TOKENS
-                             ) -> typing.Tuple[Sequence[str], list]:
-
-    results = []
+                             max_new_tokens: int = 400
+                             ) -> Sequence[str]:
     timing_data = []
 
-    for i, prompt in enumerate(tqdm(prompts)):
+    # Load precomputed CoT-only cache once
+    if use_kv_cache:
+        cache_path = os.path.join(model_floc, 'cached_prompt_kv.pt')
+        prompt_pkv, prompt_len = load_prompt_kv(cache_path, model.device)
+        max_position_embeddings = model.config.max_position_embeddings
+        print(f"Model max_position_embeddings: {max_position_embeddings}")
+
+    for i, question in enumerate(tqdm(prompts)):
         torch.cuda.empty_cache()
 
-        # Time tokenization
-        t0_tok = torch.cuda.Event(enable_timing=True)
-        t1_tok = torch.cuda.Event(enable_timing=True)
-        t0_tok.record()
+        # Tokenize question
+        t0 = torch.cuda.Event(True); t1 = torch.cuda.Event(True)
+        t0.record()
+        q_inputs = tokenizer(question, return_tensors='pt', padding=False, truncation=True)
+        t1.record(); torch.cuda.synchronize()
+        tokenization_time = t0.elapsed_time(t1) / 1000.0
 
-        if left:
-            if use_kv_cache:
-                model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left',
-                                     padding=True, truncation=True)
-            else:
-                model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left',
-                                     padding=True, truncation=True)
+        q_ids = q_inputs['input_ids'].to(model.device)  # [1, q_len]
+        q_len = q_ids.size(-1)
+
+        # If using KV-cache: feed question tokens on top of CoT cache
+        if use_kv_cache:
+            # Ensure total length doesn’t exceed model’s limit
+            max_q_len = max_position_embeddings - prompt_len
+            if q_len > max_q_len:
+                print(f"Truncating question from {q_len} to {max_q_len} tokens")
+                q_ids = q_ids[:, :max_q_len]
+                q_len = max_q_len
+
+            with torch.no_grad():
+                pos_q = torch.arange(prompt_len, prompt_len + q_len, device=model.device).unsqueeze(0)  # [1, q_len]
+                print(f"Processing question: prompt_len={prompt_len}, q_len={q_len}, max_pos={pos_q.max().item()}")
+
+                # Verify position IDs
+                if pos_q.max() >= max_position_embeddings:
+                    raise ValueError(f"Max position {pos_q.max().item()} exceeds {max_position_embeddings}")
+
+                out_q = model(
+                    input_ids=q_ids,
+                    past_key_values=prompt_pkv,
+                    position_ids=pos_q,
+                    use_cache=True
+                )
+                past_key_values = out_q.past_key_values
+
+            current_input = q_ids[:, -1:].clone()  # [1, 1]
+            generated = q_ids.clone()
+            full_prompt_len = prompt_len + q_len
         else:
-            model_inputs = tokenizer(prompt, return_tensors="pt",
-                                     padding=True, truncation=True)
-
-        token_movement_start = time.time()
-        tokenized = model_inputs.to(DEVICE)
-        torch.cuda.synchronize()
-        token_movement_end = time.time()
-        token_movement_time = token_movement_end - token_movement_start
-        print(f"token movement timing: {token_movement_time}")
-
-        t1_tok.record()
-        torch.cuda.synchronize()
-        tokenization_time = t0_tok.elapsed_time(t1_tok) / 1000.0
-
-        print(f"Tokenization time: {tokenization_time}\n")
-
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
-        input_len = input_ids.shape[-1]
-
-        past_key_values = None
-        generated = input_ids.clone().to(DEVICE)
-        current_input = input_ids.to(DEVICE)
-        current_mask = attention_mask.to(DEVICE)
+            generated = q_ids.clone()
+            current_input = None
+            past_key_values = None
+            full_prompt_len = None
 
         first_step_time = 0.0
-        rest_gen_time = 0.0
+        rest_time = 0.0
 
-        # Time generation
+        # Generation loop
         with torch.no_grad():
-            step = 0
-            while step < max_new_tokens:
-                start_ev = torch.cuda.Event(enable_timing=True)
-                end_ev = torch.cuda.Event(enable_timing=True)
-                start_ev.record()
-
-                if step % 25 == 0:
-                    print(f"single sequence step: {step}")
+            for step in range(max_new_tokens):
+                ev_start = torch.cuda.Event(True)
+                ev_end = torch.cuda.Event(True)
+                ev_start.record()
 
                 if use_kv_cache:
+                    pos_id = full_prompt_len + step
+                    if pos_id >= max_position_embeddings:
+                        print(f"Stopping at step {step}: position {pos_id} exceeds {max_position_embeddings}")
+                        break
+                    position_ids = torch.tensor([[pos_id]], device=model.device)
                     out = model(
                         input_ids=current_input,
-                        attention_mask=current_mask,
                         past_key_values=past_key_values,
+                        position_ids=position_ids,
                         use_cache=True
                     )
                     past_key_values = out.past_key_values
                 else:
-                    out = model(
-                        input_ids=generated,
-                        attention_mask=(generated != tokenizer.pad_token_id),
-                        use_cache=False
-                    )
+                    out = model(input_ids=generated, use_cache=False)
 
-                end_ev.record()
-                torch.cuda.synchronize()
-                elapsed = start_ev.elapsed_time(end_ev) / 1000.0
-
+                ev_end.record(); torch.cuda.synchronize()
+                elapsed = ev_start.elapsed_time(ev_end) / 1000.0
                 if step == 0:
                     first_step_time = elapsed
                 else:
-                    rest_gen_time += elapsed
+                    rest_time += elapsed
 
-                next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True).to(DEVICE)
+                next_token = out.logits[:, -1:].argmax(-1)
                 generated = torch.cat([generated, next_token], dim=-1)
 
-                # (cdz) Added early stopping at Q: generation. 
-                decoded_text = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
-                if "Q:" in decoded_text:
-                    break
-                if ANSWER_PHRASE in decoded_text:
-                    step = max_new_tokens - 10
-                
                 if use_kv_cache:
                     current_input = next_token
-                    current_mask = torch.cat([current_mask, torch.ones((current_mask.size(0), 1), dtype=current_mask.dtype, device=current_mask.device)], dim=-1)
-                else:
-                    current_input = generated
 
-                if next_token.item() == tokenizer.eos_token_id:
+                text = tokenizer.decode(generated[0, q_len:], skip_special_tokens=True)
+                if next_token.item() == tokenizer.eos_token_id or 'Q:' in text or 'The answer is' in text:
                     break
 
-                step += 1
+        total_time = first_step_time + rest_time
+        timing_data.append({
+            'index': i,
+            'question_length': q_len,
+            'tokenization_time': tokenization_time,
+            'kv_first_step_time': first_step_time,
+            'kv_rest_time': rest_time,
+            'generation_time': total_time,
+            'total_time': total_time
+        })
 
-        total_gen_time = first_step_time + rest_gen_time
-        print(f"Generation time: {total_gen_time}\n")
-        total_time = total_gen_time
-
-        timing_data.append({"index": i, "question_length": input_len,
-                            "tokenization_time": tokenization_time,
-                            "kv_time": first_step_time,
-                            "rest_gen_time": rest_gen_time,
-                            "generation_time": total_gen_time,
-                            "total_time": total_time,})
-        
-        if i % 10 == 0:
-            result = tokenizer.decode(generated[0][input_len:], skip_special_tokens=True)
-            print('-'*25 + 'EXAMPLE OUTPUT' + '-'*25)
-            print(result)
-            print('-'*25 + 'END EXAMPLE OUTPUT' + '-'*25)
-
-            ckpts_dir = os.path.join(EVALUATION_DIR, "ckpts")
-            os.makedirs(ckpts_dir, exist_ok=True)
-            csv_path = os.path.join(ckpts_dir, f"{model_name}_ckpt_{i}.csv")
-
-            with open(csv_path, 'w', newline='') as csvfile:
-                writer = csv.DictWriter(csvfile, 
-                                        fieldnames=['index', 'question_length', 'tokenization_time',
-                                                    'kv_time', 'rest_gen_time', 'generation_time', 'total_time'])
+        # Periodic checkpointing
+        if i and i % 10 == 0:
+            ckpt_dir = os.path.join(model_floc, 'ckpts')
+            os.makedirs(ckpt_dir, exist_ok=True)
+            path = os.path.join(ckpt_dir, f"{model_name}_ckpt_{i}.csv")
+            import csv
+            with open(path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=timing_data[0].keys())
                 writer.writeheader()
-                for row in timing_data:
-                    writer.writerow(row)
+                writer.writerows(timing_data)
+
+    return timing_data
+
+def kv_decode_sequential(model,
+                         model_name: str,
+                         tokenizer,
+                         prompts: Sequence[str],
+                         max_new_tokens: int = 400
+                         ) -> Sequence[dict]:
+    """
+    Implements KV caching as reccomended in proposal feedback
+    """
+    timing_data = []
+
+    for i, question in enumerate(tqdm(prompts, desc="Generating")):
+        torch.cuda.empty_cache()
+
+        # Tokenization timing
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
+        inputs = tokenizer(question,
+                           return_tensors="pt",
+                           truncation=True).to(model.device)
+        t1.record(); torch.cuda.synchronize()
+        tokenization_time = t0.elapsed_time(t1) / 1000.0
+
+        # Generation timing
+        gen_t0 = torch.cuda.Event(enable_timing=True)
+        gen_t1 = torch.cuda.Event(enable_timing=True)
+        gen_t0.record()
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True
+        )
+        gen_t1.record(); torch.cuda.synchronize()
+        generation_time = gen_t0.elapsed_time(gen_t1) / 1000.0
+
+        q_len = inputs["input_ids"].size(-1)
+
+        # To match original schema:
+        first_step_time = generation_time  # total only; no breakdown
+        rest_time = 0.0                    # can't isolate rest steps
+        total_time = tokenization_time + generation_time
+
+        timing_data.append({
+            'index': i,
+            'question_length': q_len,
+            'tokenization_time': tokenization_time,
+            'kv_first_step_time': first_step_time,
+            'kv_rest_time': rest_time,
+            'generation_time': total_time,
+            'total_time': total_time
+        })
+
+        # Periodic checkpointing
+        if i and i % 10 == 0:
+            ckpt_dir = os.path.join(EVALUATION_DIR, "ckpts")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            path = os.path.join(ckpt_dir, f"{model_name}_ckpt_{i}.csv")
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=timing_data[0].keys())
+                writer.writeheader()
+                writer.writerows(timing_data)
 
     return timing_data
 
@@ -341,9 +403,9 @@ def main(argvs,i):
 
     # TODO FIX ARGS HERE
     if isDecoder:
-        timings = manual_decode_sequential(model, save_modname, 0, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
+        timings = generate_with_transformers(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
     else:
-        timings = manual_decode_sequential(model, save_modname, 0, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
+        timings = generate_with_transformers(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
 
         
     csv_dir = os.path.join(argvs.out, "timing_logs")
