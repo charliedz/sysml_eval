@@ -64,19 +64,21 @@ COT_PROMPT = preamble+'\n'+q1+'\n'+q2+'\n'+q3+'\n'+q4+'\n'+q5+'\n'+q6+'\n'+q7+'\
 LTSBS = "Let's think step by step. "
 
 ANSWER_PHRASE = "The answer is"
-INVALD_RESPONSE = "<inv>"
-VALID_CORRECT = "<vc>"
-VALID_INCORRECT = "<vi>"
 NUM_RE = re.compile(r"-?\d+[\d,]*\.?\d*")
 TEST_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
-HF_TOKEN = "" # TODO : don't put this on gh, only fill when local testing
-MAX_TOKENS = 600
+MAX_TOKENS = 400
 DEVICE = 'cuda'
-SEED = 58 # pick any here idk 
 SAMPLES = 25 #TODO: Change this
-GSM8K_DATA = './data/gsm8k_test.jsonl'
-GSM_SYMBOLIC_DATA = "./data/Symbolic_Templates_26-50.json"
 EVALUATION_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR = os.path.dirname(EVALUATION_DIR)
+GSM_SYMBOLIC_DATA = os.path.join(EVALUATION_DIR, "data/Symbolic_Templates_26-50.json")
+
+
+
+GEMMA_DIR = os.path.join(EVALUATION_DIR, "models/gemma-2-2b-it")
+MATHSTRAL_DIR = os.path.join(EVALUATION_DIR, "models/Mathstral-7B-v0.1")
+RHO_DIR = os.path.join(EVALUATION_DIR, "models/rho-math-1b-v0.1")
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -86,8 +88,7 @@ def parse_args():
         default="google/gemma-2-2b-it",
         help="hf model-name",
     )
-    # TODO (cdz) : this isn't used; maybe just use the json path?
-    #              or not, with symbolic templates in mind
+
     parser.add_argument(
         "--in",
         type=str,
@@ -108,11 +109,6 @@ def parse_args():
         help="enable debugging"
     )
 
-    parser.add_argument(
-        "--dq",
-        action="store_true",
-        help="don't quantize model"
-    )
 
     parser.add_argument(
         "--t",
@@ -126,31 +122,17 @@ def parse_args():
         help='Set the number of samples',
         default=SAMPLES
     )
-    parser.add_argument(
-        "--l",
-        type=int,
-        default=0,
-        help="number of loops"
-    )
 
     args = parser.parse_args()
     return args
 
-def load_model(hf_name,hf_token=HF_TOKEN,dq=False):
-    '''Load the desired hf model/tokenizer and return'''
-    login(hf_token)
-    print('-'*25+'Loading Model: ' + hf_name + ' '+ '-'*25)
-    tokenizer = AutoTokenizer.from_pretrained(hf_name)
-    model = AutoModelForCausalLM.from_pretrained(hf_name,torch_dtype=torch.float16)
-    if not dq:
-        model.half()
-
+def load_model(model_dir):
+    '''Load the desired hf model/tokenizer and return'''    
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        
-    print("Loading device to cuda.... ")
+    model = AutoModelForCausalLM.from_pretrained(model_dir,torch_dtype=torch.float16)
     model.to(DEVICE)
-    print("Done loading to cuda!")
     model.eval()
     return model, tokenizer
 
@@ -168,76 +150,25 @@ def create_prompt(question):
         prompt.append(COT_PROMPT + 'Q: ' + q + "\n" + "A: " + LTSBS)
     return prompt
 
-def infer_sequential(model, tokenizer, prompt: Sequence[str], left=False) -> typing.Tuple[Sequence[str], list]:
-    torch.cuda.empty_cache()
-
-    results = []
-    timing_data = []
-
-    for i, p in enumerate(tqdm(prompt)):
-        # Time tokenization (cpu)
-        t_start_tok = time.time()
-        if left:
-            model_inputs = tokenizer(p, return_tensors="pt", padding_side='left',
-                                     padding=True, truncation=True)
-        else:
-            model_inputs = tokenizer(p, return_tensors="pt",
-                                     padding=True, truncation=True)
-        t_end_tok = time.time()
-        tokenization_time = t_end_tok - t_start_tok
-        print(f'Tokenization Time: {tokenization_time}\n')
-        input_len = model_inputs['input_ids'].shape[1]
-
-        token_movement_start = time.time()
-        model_inputs.to(DEVICE)
-        torch.cuda.synchronize()
-        token_movement_end = time.time()
-        token_movement_time = token_movement_end - token_movement_start
-        print(f"token movement timing: {token_movement_time}")
-
-        # Mimic KV Timing.
-        start_kv, end_kv = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
-        start_kv.record()
-        with torch.no_grad():
-            _ = model(**model_inputs)
-        end_kv.record()
-        torch.cuda.synchronize()
-        kv_time = start_kv.elapsed_time(end_kv) / 1000.0  # ms to s
-        print(f'KV Time: {kv_time}\n')
-
-        # Time generation
-        start_gen, end_gen = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
-        start_gen.record()
-        with torch.no_grad():
-            generated_ids = model.generate(**model_inputs,
-                                           max_new_tokens=MAX_TOKENS,
-                                           do_sample=False,
-                                           num_return_sequences=1,
-                                           eos_token_id=tokenizer.eos_token_id,
-                                           early_stopping=True)
-        end_gen.record()
-        torch.cuda.synchronize()
-        gen_time = start_gen.elapsed_time(end_gen) / 1000.0  # ms to s
-
-        total_time = kv_time + gen_time
-        print(f"Generation time: {gen_time}\n")
-
-
-        timing_data.append({
-            'index': i,
-            'question_length': input_len,
-            'tokenization_time': tokenization_time,
-            'kv_time': kv_time,
-            'generation_time': gen_time,
-            'total_time': total_time,
-        })
-
-    return timing_data
+def load_prompt_kv(path: str, device: torch.device):
+    """
+    Load a serialized prompt cache and move to GPU
+    """
+    data = torch.load(path, map_location='cpu')
+    pkv_cpu = data["past_key_values"]
+    # Move back to device if possible
+    try:
+        pkv_gpu = pkv_cpu.to(device)
+    except Exception:
+        pkv_gpu = pkv_cpu
+    mask_gpu = data["prompt_mask"].to(device)
+    length = data["prompt_len"]
+    print(f"Loaded prompt KV cache from {path}")
+    return pkv_gpu, mask_gpu, length
 
 def manual_decode_sequential(model,
-                             model_name, 
+                             model_name,
+                             model_floc,
                              tokenizer,
                              prompts: Sequence[str],
                              use_kv_cache: bool = True,
@@ -258,7 +189,7 @@ def manual_decode_sequential(model,
 
         if left:
             if use_kv_cache:
-                model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='right',
+                model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left',
                                      padding=True, truncation=True)
             else:
                 model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left',
@@ -379,16 +310,6 @@ def manual_decode_sequential(model,
 
     return timing_data
 
-
-def remove_prompt(prompts, model_inputs, tokenizer, generated_ids):
-    results = []
-    for i, prompt in enumerate(prompts):
-        input_length = model_inputs['input_ids'][i].shape[0]
-        result = tokenizer.decode(generated_ids[i][input_length:])
-        results.append(result)
-    return results
-
-
 def main(argvs,i):
     global SAMPLES
     DEBUGGING = argvs.debug
@@ -396,7 +317,10 @@ def main(argvs,i):
     isDecoder = True if any(x in argvs.model.split('/')[1].lower() for x in
                              ('llama','gemma')) else False
 
-    model, tokenizer = load_model(argvs.model, dq=argvs.dq)
+    if argvs.model == "google/gemma-2-2b-it":
+        model_path = GEMMA_DIR
+
+    model, tokenizer = load_model(model_path)
     
     split_modname = argvs.model.split('/')
     save_modname = split_modname[1].strip()
@@ -415,19 +339,13 @@ def main(argvs,i):
             tests.append((loaded_data[i]['question_'+str(choice)],loaded_data[i]['answer_'+str(choice)]))
             j += 1
 
-
-    # some models are decoder only, so we need to set left-padding for tokenizer
-    # or we get issues with repetion of padding tokens!
-    # inference timing
+    # TODO FIX ARGS HERE
     if isDecoder:
-        # timings = infer_sequential(model, tokenizer, [t[0] for t in tests], left=True)
-        timings = manual_decode_sequential(model, save_modname, tokenizer, [t[0] for t in tests], use_kv_cache=False, left=True)
+        timings = manual_decode_sequential(model, save_modname, 0, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
     else:
-        # timings = infer_sequential(model, tokenizer, [t[0] for t in tests])
-        timings = manual_decode_sequential(model, save_modname, tokenizer, [t[0] for t in tests], use_kv_cache=False, left=True)
+        timings = manual_decode_sequential(model, save_modname, 0, tokenizer, [t[0] for t in tests], use_kv_cache=True, left=True)
 
         
-
     csv_dir = os.path.join(argvs.out, "timing_logs")
     os.makedirs(csv_dir, exist_ok=True)
     csv_path = os.path.join(csv_dir, f"{save_modname}_{i}.csv")
@@ -445,12 +363,4 @@ def main(argvs,i):
 if __name__ == "__main__":
     ### cli functionality here. 
     argvs = parse_args()
-    loop = argvs.l
-    if loop == 0:
-        main(argvs,argvs.t)
-    else:
-        i = 0
-        while i < loop:
-            print(i)
-            main(argvs,i)
-            i += 1
+    main(argvs,argvs.t)
