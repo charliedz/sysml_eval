@@ -403,9 +403,9 @@ def main(argvs,i):
 
     # TODO FIX ARGS HERE
     if isDecoder:
-        timings = generate_with_transformers(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
+        timings = kv_decode_sequential(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
     else:
-        timings = generate_with_transformers(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
+        timings = kv_decode_sequential(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
 
         
     csv_dir = os.path.join(argvs.out, "timing_logs")
