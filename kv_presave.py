@@ -2,6 +2,7 @@ import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import typing
+from tqdm import tqdm
 
 preamble = "As an expert problem solver, solve step by step the following mathematical questions."
 q1 = "Q: There are 15 trees in the grove. Grove workers will plant trees in the grove today. "\
@@ -55,31 +56,9 @@ GEMMA_DIR = os.path.join(MODELS, "gemma-2-2b-it")
 MATHSTRAL_DIR = os.path.join(MODELS, "Mathstral-7B-v0.1")
 RHO_MATH_DIR = os.path.join(MODELS, "rho-math-1b-v0.1")
 
-def save_prompt_kv(path: str,
-                   past_key_values: typing.Tuple[typing.Tuple[torch.Tensor,torch.Tensor],...],
-                   prompt_mask: torch.Tensor,
-                   prompt_len: int):
-    """
-    Move all tensors to CPU and save the cache dict to `path`.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # detach + cpu
-    pkv_cpu = tuple(
-        (layer_k.cpu(), layer_v.cpu())
-        for (layer_k, layer_v) in past_key_values
-    )
-    data = {
-        "past_key_values": pkv_cpu,
-        "prompt_mask": prompt_mask.cpu(),
-        "prompt_len": prompt_len
-    }
-    torch.save(data, path)
-    print(f"Saved prompt KV cache to {path}")
-
 def precompute_prompt_kv(model, tokenizer, prompt: str):
     """
-    Tokenize the shared prompt and run through the model once to obtain
-    `past_key_values` for reuse across multiple generations.
+    Tokenize the CoT prompt and generate one new token so that KV cache can be saved
     """
     inputs = tokenizer(
         prompt,
@@ -95,17 +74,66 @@ def precompute_prompt_kv(model, tokenizer, prompt: str):
             attention_mask=inputs["attention_mask"],
             use_cache=True
         )
-    # Return both the past_key_values and initial mask/length
+
     return out.past_key_values, inputs["attention_mask"].clone(), inputs["input_ids"].shape[-1]
+
+
+def save_prompt_kv(path: str,
+                   past_key_values: typing.Any,
+                   prompt_mask: torch.Tensor,
+                   prompt_len: int):
+    """
+    Serialize a precomputed prompt cache to disk.
+    Handles HybridCache or tuple-of-tuples by relying on `.to('cpu')`.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Attempt to move cache to CPU
+    try:
+        pkv_cpu = past_key_values.to('cpu')
+    except Exception:
+        pkv_cpu = past_key_values
+
+    data = {
+        "past_key_values": pkv_cpu,
+        "prompt_mask": prompt_mask.cpu(),
+        "prompt_len": prompt_len
+    }
+    torch.save(data, path)
+    print(f"Saved prompt KV cache to {path}")
+
+
+def load_prompt_kv(path: str, device: torch.device):
+    """
+    Load a serialized prompt cache from disk, moving it back to `device`.
+    Works with HybridCache or tuple-of-tuples.
+    """
+    data = torch.load(path, map_location='cpu')
+    pkv_cpu = data["past_key_values"]
+    # Move back to device if possible
+    try:
+        pkv_gpu = pkv_cpu.to(device)
+    except Exception:
+        pkv_gpu = pkv_cpu
+    mask_gpu = data["prompt_mask"].to(device)
+    length = data["prompt_len"]
+    print(f"Loaded prompt KV cache from {path}")
+    return pkv_gpu, mask_gpu, length
 
 
 def main():
     model_dirs = [GEMMA_DIR, MATHSTRAL_DIR, RHO_MATH_DIR]
 
-    for i in model_dirs:
+    for i in tqdm(model_dirs):
+        print("Loading Tokenizer....\n")
         tokenizer = AutoTokenizer.from_pretrained(i)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        print("Loading Model....\n")
         model = AutoModelForCausalLM.from_pretrained(i,torch_dtype=torch.float16)
+        print("Sending Model to CUDA....\n")
         model.to(DEVICE)
         kv, prompt_mask, prompt_len = precompute_prompt_kv(model, tokenizer, COT_PROMPT)
         save_prompt_kv(os.path.join(i,'cached_prompt_kv.pt'), kv, prompt_mask, prompt_len)
 
+if __name__ == "__main__": 
+    main()
