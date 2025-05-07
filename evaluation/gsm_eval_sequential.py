@@ -345,18 +345,17 @@ def kv_decode_sequential(model,
 
         q_len = inputs["input_ids"].size(-1)
 
-        # To match original schema:
-        first_step_time = generation_time  # total only; no breakdown
-        rest_time = 0.0                    # can't isolate rest steps
+        first_step_time = 0.0
+        rest_time = 0.0
         total_time = tokenization_time + generation_time
 
         timing_data.append({
             'index': i,
             'question_length': q_len,
             'tokenization_time': tokenization_time,
-            'kv_first_step_time': first_step_time,
-            'kv_rest_time': rest_time,
-            'generation_time': total_time,
+            'kv_time': first_step_time,
+            'rest_gen_time': rest_time,
+            'generation_time': generation_time,
             'total_time': total_time
         })
 
