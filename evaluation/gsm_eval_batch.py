@@ -1,20 +1,16 @@
-''' (cdz) cmsc723 final 2024 '''
-
-# This script batches prompts and infers, rather than going one prompt at a time. 
+""" BATCHING """
 
 import os
 import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import re
 import random
 import json
-import time
-import typing
 from collections.abc import Sequence
-from huggingface_hub import login
 import csv
+from tqdm import tqdm
 
+CUDA_LAUNCH_BLOCKING=1
 
 ### CoT Prompt String. 
 preamble = "As an expert problem solver, solve step by step the following mathematical questions."
@@ -61,19 +57,28 @@ COT_QS = (q1, q2, q3, q4, q5, q6, q7, q8)
 COT_PROMPT = preamble+'\n'+q1+'\n'+q2+'\n'+q3+'\n'+q4+'\n'+q5+'\n'+q6+'\n'+q7+'\n'+q8+'\n'
 LTSBS = "Let's think step by step. "
 
-ANSWER_PHRASE = "The answer is"
-INVALD_RESPONSE = "<inv>"
-VALID_CORRECT = "<vc>"
-VALID_INCORRECT = "<vi>"
-NUM_RE = re.compile(r"-?\d+[\d,]*\.?\d*")
-TEST_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
-HF_TOKEN = "" # Leave this empty except when running local tests
-MAX_TOKENS = 1024
+MAX_TOKENS = 400
 DEVICE = 'cuda'
-SEED = 58 # pick any here idk 
-SAMPLES = 25 #TODO: Change this
-GSM8K_DATA = './data/gsm8k_test.jsonl'
-GSM_SYMBOLIC_DATA = "./data/Symbolic_Templates_26-50.json"
+SAMPLES = 2
+BATCH_SIZE = 4
+
+PHRASE = "The answer is"
+MAX_TOKENS = 400
+DEVICE = 'cuda'
+SAMPLES = 2
+
+EVALUATION_DIR = os.path.dirname(os.path.abspath(__file__))
+CKPTS_DIR = os.path.join(EVALUATION_DIR, "ckpts")
+TIMINGS_DIR = os.path.join(EVALUATION_DIR, "timings")
+
+_BASE_DIR = os.path.dirname(EVALUATION_DIR)
+GSM_SYMBOLIC_DATA = os.path.join(EVALUATION_DIR, "data/Symbolic_Templates_26-50.json")
+
+GEMMA_DIR = os.path.join(EVALUATION_DIR, "models/gemma-2-2b-it")
+MATHSTRAL_DIR = os.path.join(EVALUATION_DIR, "models/Mathstral-7B-v0.1")
+RHO_DIR = os.path.join(EVALUATION_DIR, "models/rho-math-1b-v0.1")
+GEMMA_7B_DIR = os.path.join(EVALUATION_DIR, "models/gemma-7b-it")
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -83,39 +88,6 @@ def parse_args():
         default="google/gemma-2-2b-it",
         help="hf model-name",
     )
-    # TODO (cdz) : this isn't used; maybe just use the json path?
-    #              or not, with symbolic templates in mind
-    parser.add_argument(
-        "--in",
-        type=str,
-        default="./data",
-        help="directory with data",
-    )
-
-    parser.add_argument(
-        "--out",
-        type=str,
-        default="./timings",
-        help="output directory",
-    )
-    
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="enable debugging"
-    )
-
-    parser.add_argument(
-        "--dq",
-        action="store_true",
-        help="don't quantize model"
-    )
-
-    parser.add_argument(
-        "--t",
-        default='0',
-        help='extension to add to saved filename'
-    )
 
     parser.add_argument(
         '--samples',
@@ -123,31 +95,22 @@ def parse_args():
         help='Set the number of samples',
         default=SAMPLES
     )
+
     parser.add_argument(
-        "--l",
-        type=int,
-        default=0,
-        help="number of loops"
+        '--batch-size', type=int, default=BATCH_SIZE,
+        help='Batch size for tokenization and generation',
     )
 
     args = parser.parse_args()
     return args
 
-def load_model(hf_name,hf_token=HF_TOKEN,dq=False):
-    '''Load the desired hf model/tokenizer and return'''
-    login(hf_token)
-    print('-'*25+'Loading Model: ' + hf_name + ' '+ '-'*25)
-    tokenizer = AutoTokenizer.from_pretrained(hf_name)
-    model = AutoModelForCausalLM.from_pretrained(hf_name,torch_dtype=torch.float16)
-    if not dq:
-        model.half()
-
+def load_model(model_dir):
+    '''Load the desired hf model/tokenizer and return'''    
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        
-    print("Loading device to cuda.... ")
+    model = AutoModelForCausalLM.from_pretrained(model_dir,torch_dtype=torch.float16)
     model.to(DEVICE)
-    print("Done loading to cuda!")
     model.eval()
     return model, tokenizer
 
@@ -165,92 +128,100 @@ def create_prompt(question):
         prompt.append(COT_PROMPT + 'Q: ' + q + "\n" + "A: " + LTSBS)
     return prompt
 
-def infer(model, tokenizer, prompt: Sequence, left=False) -> typing.Tuple[Sequence[str], list]:
-    """Handle inference and timings
-    
-    Args:
-        model: the LLM to evaluate
-        tokenizer: the associated tokenizer
-        prompt: the whole prompt to run inference on
-        question: the initial question (for length)
-        left: whether to use decoder-only left padding
-    """
-    torch.cuda.empty_cache()
-
-    # --- Time tokenization ---
-    t_start_tok = time.time()
-    if left:
-        model_inputs = tokenizer(prompt, return_tensors="pt", padding_side='left',
-                                 padding=True, truncation=True).to(DEVICE)
-    else:
-        model_inputs = tokenizer(prompt, return_tensors="pt",
-                                 padding=True, truncation=True).to(DEVICE)
-    t_end_tok = time.time()
-    tokenization_time = t_end_tok - t_start_tok
-
-    input_lengths = [len(x) for x in model_inputs['input_ids']]
-
-    # Time simple forward pass on just prompt -- approximation of KV cache computation time. 
-    torch.cuda.synchronize()
-    t_start_kv = time.time()
-    with torch.no_grad():
-        _ = model(**model_inputs)  # Run on the prompt. 
-    torch.cuda.synchronize()
-    t_end_kv = time.time()
-    kv_time = t_end_kv - t_start_kv
-
-    # Time autoregressive task 
-    torch.cuda.synchronize()
-    t_start_gen = time.time()
-    with torch.no_grad():
-        generated_ids = model.generate(**model_inputs,
-                                       max_new_tokens=MAX_TOKENS,
-                                       do_sample=False,
-                                       num_return_sequences=1,
-                                       eos_token_id=tokenizer.eos_token_id,
-                                       early_stopping=True)
-    torch.cuda.synchronize()
-    t_end_gen = time.time()
-    gen_time = t_end_gen - t_start_gen
-
-    total_time = kv_time + gen_time
-
-    results = remove_prompt(prompt, model_inputs, tokenizer, generated_ids)
-
-    # Gather timings per sample 
+def kv_decode_batched(model,
+                      model_name: str,
+                      tokenizer,
+                      prompts: Sequence[str],
+                      max_new_tokens: int = 400,
+                      batch_size: int = 1
+                      ) -> Sequence[dict]:
     timing_data = []
-    for i in range(len(prompt)):
-        timing_data.append({
-            'index': i,
-            'question_length': input_lengths[i],
-            'tokenization_time': tokenization_time,
-            'kv_time': kv_time,
-            'generation_time': gen_time,
-            'total_time': total_time,
-        })
+    total_prompts = len(prompts)
 
-    return results, timing_data
+    # create a sample-level progress bar
+    progress = tqdm(total=total_prompts, desc="Generating", unit="prompt")
 
-def remove_prompt(prompts, model_inputs, tokenizer, generated_ids):
-    results = []
-    for i, prompt in enumerate(prompts):
-        input_length = model_inputs['input_ids'][i].shape[0]
-        result = tokenizer.decode(generated_ids[i][input_length:])
-        results.append(result)
-    return results
+    # process in batches
+    for batch_start in range(0, total_prompts, batch_size):
+        batch_end = min(batch_start + batch_size, total_prompts)
+        batch_prompts = prompts[batch_start:batch_end]
+        actual_batch = len(batch_prompts)
 
-def main(argvs,i):
+        torch.cuda.empty_cache()
+
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
+        # tokenize and pad
+        inputs = tokenizer(batch_prompts,
+                           return_tensors="pt",
+                           padding=True,
+                           truncation=True)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        t1.record()
+        torch.cuda.synchronize()
+        batch_token_time = t0.elapsed_time(t1) / 1000.0
+        token_time_per = batch_token_time / actual_batch
+
+        gen_t0 = torch.cuda.Event(enable_timing=True)
+        gen_t1 = torch.cuda.Event(enable_timing=True)
+        gen_t0.record()
+        _ = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True
+        )
+        gen_t1.record()
+        torch.cuda.synchronize()
+        batch_gen_time = gen_t0.elapsed_time(gen_t1) / 1000.0
+        gen_time_per = batch_gen_time / actual_batch
+
+        for idx_in_batch in range(actual_batch):
+            global_idx = batch_start + idx_in_batch
+            q_len = inputs["input_ids"][idx_in_batch].ne(tokenizer.pad_token_id).sum().item()
+            timing_data.append({
+                'index': global_idx,
+                'question_length': q_len,
+                'tokenization_time': token_time_per,
+                'kv_time': 0.0,
+                'rest_gen_time': 0.0,
+                'generation_time': gen_time_per,
+                'total_time': token_time_per + gen_time_per
+            })
+
+        progress.update(actual_batch)
+
+        last_idx = batch_end - 1
+        if last_idx != 0 and last_idx % 10 == 0:
+            os.makedirs(CKPTS_DIR, exist_ok=True)
+            path = os.path.join(CKPTS_DIR, f"{model_name}_ckpt_{last_idx}.csv")
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=timing_data[0].keys())
+                writer.writeheader()
+                writer.writerows(timing_data)
+
+    progress.close()
+    return timing_data
+
+def main(argvs):
     global SAMPLES
-    DEBUGGING = argvs.debug
     SAMPLES = argvs.samples
-    isDecoder = True if any(x in argvs.model.split('/')[1].lower() for x in
-                             ('llama','gemma')) else False
+    batch_size = argvs.batch_size
 
-    model,tokenizer = load_model(argvs.model, dq=argvs.dq)
+    if argvs.model == "google/gemma-2-2b-it":
+        model_path = GEMMA_DIR
+    elif argvs.model == "mistralai/Mathstral-7B-v0.1":
+        model_path = MATHSTRAL_DIR
+    elif argvs.model == "microsoft/rho-math-1b-v0.1":
+        model_path = RHO_DIR
+    elif argvs.model == "google/gemma-7b-it":
+        model_path = GEMMA_7B_DIR
+
+    model, tokenizer = load_model(model_path)
     
     split_modname = argvs.model.split('/')
     save_modname = split_modname[1].strip()
-    os.makedirs(argvs.out, exist_ok=True)
 
     tests = []
     with open(GSM_SYMBOLIC_DATA,'r') as f:
@@ -265,24 +236,19 @@ def main(argvs,i):
             tests.append((loaded_data[i]['question_'+str(choice)],loaded_data[i]['answer_'+str(choice)]))
             j += 1
 
+    timings = kv_decode_batched(model,
+                                save_modname, 
+                                tokenizer, 
+                                [t[0] for t in tests], 
+                                max_new_tokens=MAX_TOKENS, 
+                                batch_size=batch_size)
 
-    # some models are decoder only, so we need to set left-padding for tokenizer
-    # or we get issues with repetion of padding tokens!
-    # inference timing
-    if isDecoder:
-        responses, timings = infer(model, tokenizer, [t[0] for t in tests], left=True)
-    else:
-        responses, timings = infer(model, tokenizer, [t[0] for t in tests])
-        
-
-    csv_dir = os.path.join(argvs.out, "timing_logs")
-    os.makedirs(csv_dir, exist_ok=True)
-    csv_path = os.path.join(csv_dir, f"{save_modname}_{i}.csv")
+    csv_path = os.path.join(TIMINGS_DIR, f"{save_modname}-kv-batch-3080.csv")
 
     with open(csv_path, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=[
-            'index', 'question_length', 'tokenization_time', 'kv_time', 'generation_time', 'total_time'
-        ])
+        writer = csv.DictWriter(csvfile, 
+                                fieldnames=['index', 'question_length', 'tokenization_time',
+                                            'kv_time', 'rest_gen_time', 'generation_time', 'total_time'])
         writer.writeheader()
         for row in timings:
             writer.writerow(row)
@@ -290,14 +256,5 @@ def main(argvs,i):
     print('done!')
 
 if __name__ == "__main__":
-    ### cli functionality here. 
     argvs = parse_args()
-    loop = argvs.l
-    if loop == 0:
-        main(argvs,argvs.t)
-    else:
-        i = 0
-        while i < loop:
-            print(i)
-            main(argvs,i)
-            i += 1
+    main(argvs)
