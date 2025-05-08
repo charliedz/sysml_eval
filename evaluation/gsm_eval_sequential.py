@@ -76,7 +76,7 @@ GSM_SYMBOLIC_DATA = os.path.join(EVALUATION_DIR, "data/Symbolic_Templates_26-50.
 GEMMA_DIR = os.path.join(EVALUATION_DIR, "models/gemma-2-2b-it")
 MATHSTRAL_DIR = os.path.join(EVALUATION_DIR, "models/Mathstral-7B-v0.1")
 RHO_DIR = os.path.join(EVALUATION_DIR, "models/rho-math-1b-v0.1")
-
+GEMMA_7B_DIR = os.path.join(EVALUATION_DIR, "models/gemma-7b-it")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -384,6 +384,8 @@ def main(argvs,i):
         model_path = MATHSTRAL_DIR
     elif argvs.model == "microsoft/rho-math-1b-v0.1":
         model_path = RHO_DIR
+    elif argvs.model == "google/gemma-7b-it":
+        model_path = GEMMA_7B_DIR
 
     model, tokenizer = load_model(model_path)
     
