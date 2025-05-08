@@ -185,15 +185,6 @@ def kv_precompute_decode(model,
                          ):
     """
     Use precomputed KV cache and then decode
-    
-    Args:
-        model: The loaded language model.
-        tokenizer: The tokenizer corresponding to the model.
-        prompts: List of question strings to process.
-        max_tokens: Maximum number of tokens to generate per response.
-    
-    Returns:
-        List of dictionaries containing timing information for each question.
     """
     timings = []
     # Load precomputed KV cache for CoT prompt and move to GPU
