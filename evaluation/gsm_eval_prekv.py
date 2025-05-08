@@ -68,7 +68,7 @@ NUM_RE = re.compile(r"-?\d+[\d,]*\.?\d*")
 TEST_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
 MAX_TOKENS = 400
 DEVICE = 'cuda'
-SAMPLES = 25 #TODO: Change this
+SAMPLES = 2
 
 EVALUATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _BASE_DIR = os.path.dirname(EVALUATION_DIR)
@@ -197,7 +197,7 @@ def kv_precompute_decode(model,
     """
     timings = []
     # Load precomputed KV cache for CoT prompt and move to GPU
-    cache = os.path.join(EVALUATION_DIR, "models", "cached_prompt_kv.pt")
+    cache = os.path.join(EVALUATION_DIR, "models", modelname,"cached_prompt_kv.pt")
     print(f"debug: cache correct: {os.path.exists(cache)}")
     
     pkv_cot, prompt_len_cot = load_prompt_kv(cache, DEVICE)
@@ -286,7 +286,7 @@ def main(argvs,i):
             tests.append((loaded_data[i]['question_'+str(choice)],loaded_data[i]['answer_'+str(choice)]))
             j += 1
 
-    timings = kv_precompute_decode(model, save_modname, tokenizer, [t[0] for t in tests], max_new_tokens=MAX_TOKENS)
+    timings = kv_precompute_decode(model, save_modname, tokenizer, [t[0] for t in tests], max_tokens=MAX_TOKENS)
         
     csv_dir = os.path.join(argvs.out, "timing_logs")
     os.makedirs(csv_dir, exist_ok=True)
