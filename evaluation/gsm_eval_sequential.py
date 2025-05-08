@@ -1,6 +1,3 @@
-
-
-
 import os
 import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM, cache_utils
@@ -68,7 +65,7 @@ NUM_RE = re.compile(r"-?\d+[\d,]*\.?\d*")
 TEST_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
 MAX_TOKENS = 400
 DEVICE = 'cuda'
-SAMPLES = 25 #TODO: Change this
+SAMPLES = 2
 EVALUATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _BASE_DIR = os.path.dirname(EVALUATION_DIR)
 GSM_SYMBOLIC_DATA = os.path.join(EVALUATION_DIR, "data/Symbolic_Templates_26-50.json")
